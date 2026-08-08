@@ -26,6 +26,7 @@ import { verifyTask } from '../src/db/verify.mjs';
 import { claimTasks, releaseTask, renewLease } from '../src/db/claim.mjs';
 import { readyTasks, formatReady } from '../src/db/ready.mjs';
 import { graphStatus, formatStatus } from '../src/db/status.mjs';
+import { commitGateStatus, formatCommitGate } from '../src/db/gate.mjs';
 import { whyPath, formatWhy } from '../src/db/why.mjs';
 import { addFriction, listFriction } from '../src/db/friction.mjs';
 import { rebuildDb } from '../src/db/rebuild.mjs';
@@ -423,8 +424,17 @@ async function init({ force, core, explicitCore, host = DEFAULT_HOST, hostOnly =
   );
   console.log('Next steps:');
   if (explicitCore) {
-    console.log(`  1. ${bold('git add -A && git commit -m "chore: install Hedgehog"')}`);
-    console.log(`  2. ${bold('pnpm install')}`);
+    // `pnpm install` before the first commit, not after it. The core's
+    // commit gate is lefthook, and lefthook's hooks are written by its
+    // own postinstall — so a commit made before the install is a commit
+    // made with no gate at all, and the instruction that put it first
+    // was quietly teaching the project to skip its own discipline on
+    // the one commit that lands the entire workspace. Installing first
+    // means commit #1 is already gated; with no HEAD to diff against it
+    // runs the whole workspace (see lefthook.yml), so expect it to take
+    // as long as a full typecheck/lint/test — that is the gate working.
+    console.log(`  1. ${bold('pnpm install')}`);
+    console.log(`  2. ${bold('git add -A && git commit -m "chore: install Hedgehog"')}`);
     console.log(`  3. Open ${HOSTS[host].label} and describe what you want to build.`);
   } else {
     console.log(`  1. ${bold('git add -A && git commit -m "chore: install Hedgehog"')}`);
@@ -965,6 +975,18 @@ async function statusCommand() {
   }
 
   console.log(formatStatus(result));
+
+  // Whether the commit gate is actually enforcing. This is reported at
+  // the start of every session because a gate that isn't running looks
+  // exactly like one that is — `.git/hooks` exists, `lefthook.yml` is
+  // committed, and a passing commit prints nothing to tell the two
+  // apart. Nothing else in the discipline would notice.
+  const gate = await commitGateStatus(DEST_ROOT);
+  const gateText = formatCommitGate(gate);
+  if (gateText) {
+    console.log('');
+    console.log(gate.state === 'active' ? dim(gateText) : yellow(gateText));
+  }
 }
 
 // `hedgehog ready` — read-only preview of what a `hedgehog claim` call
