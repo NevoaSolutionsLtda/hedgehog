@@ -2,8 +2,9 @@
 // Payload integrity check. Hedgehog's product IS the agents/skills
 // payload, so this validates the things that would otherwise ship
 // silently broken: frontmatter consistency, cross-references between
-// agent/skill files, both shipped core.yaml files, the published
-// tarball's contents, and the CLI entrypoint.
+// agent/skill files, both shipped core.yaml files, the verify commands
+// those cores gate every build step with, the published tarball's
+// contents, and the CLI entrypoint.
 //
 // Run with `pnpm check`. Exits non-zero on any failure — wired into
 // publish.yml as a gate before `npm publish`.
@@ -15,6 +16,7 @@ import { execFileSync } from 'node:child_process';
 import { parse } from '../src/hosts/frontmatter.mjs';
 import { AGENT_CAPABILITY } from '../src/hosts/capabilities.mjs';
 import { loadCore } from '../src/db/core.mjs';
+import { lintCoreVerifyCommands } from './lint-core-verify.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -142,6 +144,20 @@ for (const core of ['full-stack-app', 'landing-page']) {
   }
 }
 
+// ── 5c. Every layer's verify command in both shipped cores can actually
+//    run: no Jest-only flags on a Vitest core, no `pnpm <script>` that the
+//    core's package.json doesn't define, no bare `{module}` test filter,
+//    no `nx test <project>` against a shipped project with no test target.
+//    A verify command is the only gate between a task and a commit, and it
+//    is never exercised by building this package — it runs in a consuming
+//    project — so a broken one ships silently. See
+//    scripts/lint-core-verify.mjs, which also re-checks the 4.0.3 strings
+//    as a regression fixture. ──────────────────────────────────────────
+{
+  const { failures: verifyFailures } = await lintCoreVerifyCommands(ROOT);
+  for (const msg of verifyFailures) fail(msg);
+}
+
 // ── 6. Published tarball contains every agent, every skill, both cores,
 //    and the db/hosts modules the CLI needs at runtime. ────────────────
 try {
@@ -186,4 +202,6 @@ if (failures.length > 0) {
   console.error('');
   process.exit(1);
 }
-console.log(`ok — ${agents.length} agents, ${skills.length} skills, 2 cores, tarball, CLI`);
+console.log(
+  `ok — ${agents.length} agents, ${skills.length} skills, 2 cores, verify commands, tarball, CLI`,
+);
