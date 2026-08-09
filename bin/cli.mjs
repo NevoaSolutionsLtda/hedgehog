@@ -26,6 +26,7 @@ import { verifyTask } from '../src/db/verify.mjs';
 import { claimTasks, releaseTask, renewLease } from '../src/db/claim.mjs';
 import { readyTasks, formatReady } from '../src/db/ready.mjs';
 import { graphStatus, formatStatus } from '../src/db/status.mjs';
+import { coreMissingRequirements, missingBinaries } from '../src/db/requires.mjs';
 import { whyPath, formatWhy } from '../src/db/why.mjs';
 import { addFriction, listFriction } from '../src/db/friction.mjs';
 import { rebuildDb } from '../src/db/rebuild.mjs';
@@ -305,8 +306,9 @@ ${bold('Usage')}
   npx @skyf0xx/hedgehog update                    refresh the installed agents + skills
   npx @skyf0xx/hedgehog db init                   create .hedgehog/hedgehog.db if absent
   npx @skyf0xx/hedgehog db rebuild                re-derive the build graph from committed intents + git history
-  npx @skyf0xx/hedgehog plan                      compile pending intents into tasks + dependencies,
-                                                   then open the build graph if anything compiled
+  npx @skyf0xx/hedgehog plan                      compile pending intents into tasks + dependencies
+                                                   (starts no graph server; --no-open says so explicitly)
+  npx @skyf0xx/hedgehog plan --open               also start the graph server and open it, if anything compiled
   npx @skyf0xx/hedgehog intent add [flags]        add an intent (rules/requirements/dependencies)
   npx @skyf0xx/hedgehog intent add --file <path>  add an intent from a JSON file
   npx @skyf0xx/hedgehog next                      print the task packet for one ready task
@@ -570,8 +572,33 @@ async function resolveCorePath() {
   return null;
 }
 
-async function planCommand() {
+// `hedgehog plan [--open|--no-open]` — compiles pending intents.
+//
+// Starting the live graph server is opt-in (`--open`), not automatic.
+// Hedgehog's primary caller is an agent in a headless session: there is
+// no browser for `openInBrowser` to hand the URL to, so the old
+// unconditional `startOrReuseGraphServer()` bought nothing and cost a
+// detached `node` process left listening on 127.0.0.1 with an open
+// handle on the build graph, plus a `.hedgehog/graph-server.json`
+// pidfile outliving the command that wrote it. `hedgehog graph` is the
+// one command whose *purpose* is that server; `plan`'s purpose is
+// compiling the graph, and it now exits having started nothing.
+//
+// `--no-open` is accepted for symmetry with `hedgehog graph` and names
+// the default explicitly. It differs from `graph --no-open` in one way
+// that follows from the same principle: on `graph` the server is the
+// point and only the browser is suppressed, whereas on `plan` the
+// server exists solely to be opened, so suppressing the open leaves
+// nothing worth serving — no server, no pidfile, no orphan.
+async function planCommand(args = []) {
   await ensureDb();
+
+  const wantsOpen = args.includes('--open');
+  if (wantsOpen && args.includes('--no-open')) {
+    console.error(`${red('Usage:')} hedgehog plan takes --open or --no-open, not both\n`);
+    process.exitCode = 1;
+    return;
+  }
 
   const corePath = await resolveCorePath();
   if (!corePath) {
@@ -605,15 +632,20 @@ async function planCommand() {
 
   // Only worth opening when this run actually changed the graph's shape
   // — a plan run that compiled nothing (every intent already had tasks)
-  // would just re-open what's already open. planTasks's own db handle is
-  // closed by this point: the graph server opens its own connection in a
-  // separate process, and holding two write-capable handles on the same
-  // sqlite file across that handoff invites lock contention for no
-  // benefit.
-  if (result.compiled.length > 0) {
-    const { port } = await startOrReuseGraphServer();
-    openInBrowser(`http://localhost:${port}`);
+  // would just re-open what's already open.
+  if (result.compiled.length === 0) return;
+
+  if (!wantsOpen) {
+    console.log(`${dim('Run')} ${bold('hedgehog graph')} ${dim('to view the build graph.')}\n`);
+    return;
   }
+
+  // planTasks's own db handle is closed by this point: the graph server
+  // opens its own connection in a separate process, and holding two
+  // write-capable handles on the same sqlite file across that handoff
+  // invites lock contention for no benefit.
+  const { port } = await startOrReuseGraphServer();
+  presentGraphUrl(`http://localhost:${port}`);
 }
 
 // Parses `hedgehog intent add` args into the same record shape
@@ -765,6 +797,66 @@ async function nextCommand() {
   console.log(formatNext(packet));
 }
 
+// Mirrors, read-only, the condition verifyTask's own Phase 0
+// (claimForVerify) enforces: after expired leases are reaped, the task
+// must be `building` and leased to `owner`. The expiry predicate is
+// claim.mjs#reapExpiredLeases's, kept identical so this can't disagree
+// with the check it's standing in for. Writes nothing and reaps nothing
+// — the authoritative check, with its state changes, stays in verify.mjs.
+const VERIFIABLE_BY_SQL = `
+  SELECT 1 FROM tasks
+  WHERE id = ? AND status = 'building' AND lease_owner = ?
+    AND (lease_expires_at IS NULL OR lease_expires_at >= datetime('now'))
+`;
+
+function taskVerifiableBy(db, taskId, owner) {
+  return db.prepare(VERIFIABLE_BY_SQL).get(taskId, owner) !== undefined;
+}
+
+// The declared-binary gate for one task: resolves the task's layer in
+// the core definition and returns { layer, missing } when that layer's
+// `requires:` names binaries this environment can't find, or null when
+// there's nothing to say (no core, unknown task/layer, nothing missing).
+//
+// Runs ahead of verifyTask so the verify command is never handed to a
+// shell that will answer `exit 127` with no context. Deliberately makes
+// no state change: the task keeps its lease and its `building` status,
+// so installing the binary and re-running `hedgehog verify` is the whole
+// fix — no unblocking step, and no failed verification recorded for
+// something that never ran.
+//
+// It only speaks for a caller who could actually verify this task. A
+// caller holding no lease, or a stale one, has a different problem, and
+// telling them to install a binary would send them off to fix something
+// that isn't in their way — so this stays quiet and lets verifyTask
+// report the real ownership/state error. Nothing is lost by deferring:
+// claimForVerify throws before any verify command runs, so falling
+// through still records no failed verification.
+async function missingBinariesForTask(db, taskId, owner) {
+  if (!taskVerifiableBy(db, taskId, owner)) return null;
+
+  const row = db.prepare('SELECT layer FROM tasks WHERE id = ?').get(taskId);
+  if (row === undefined) return null;
+
+  const corePath = await resolveCorePath();
+  if (!corePath) return null;
+
+  let core;
+  try {
+    core = await loadCore(corePath);
+  } catch {
+    // An unloadable core.yaml is `plan`'s error to report; don't turn it
+    // into a confusing failure of an unrelated verify.
+    return null;
+  }
+
+  const layer = core.layers.find((l) => l.id === row.layer);
+  if (!layer) return null;
+
+  const missing = missingBinaries(layer.requires);
+  return missing.length === 0 ? null : { layer: layer.id, missing };
+}
+
 async function verifyCommand(args) {
   await ensureDb();
 
@@ -786,6 +878,22 @@ async function verifyCommand(args) {
   const db = openDb();
   let result;
   try {
+    const blockers = await missingBinariesForTask(db, taskId, owner);
+    if (blockers) {
+      const list = blockers.missing.map((b) => bold(b)).join(', ');
+      console.error(
+        `${red(bold('Missing required binaries.'))} Task ${bold(taskId)} (layer ${bold(blockers.layer)}) was not verified.\n`,
+      );
+      console.error(`Not found on PATH: ${list}`);
+      console.error(
+        `${dim(`Declared by layer "${blockers.layer}" in core.yaml (requires:). The verify command was not run.`)}`,
+      );
+      console.error(
+        `${dim('Install them, or put them on the PATH of the shell running hedgehog — an interactive login shell may see binaries a non-interactive one does not — then re-run this command.')}\n`,
+      );
+      process.exitCode = 1;
+      return;
+    }
     result = verifyTask(db, taskId, owner);
   } catch (err) {
     console.error(`${red('Verify failed:')} ${err.message}\n`);
@@ -964,6 +1072,22 @@ async function statusCommand() {
     db.close();
   }
 
+  // Declared-binary check (core.yaml's `requires:`) rides on `status`
+  // because status is what a fresh session runs first — that's the point
+  // at which "this core needs terraform" is a setup fact rather than an
+  // opaque exit 127 twenty minutes into the build. A project with no
+  // core definition yet (deferred install, before bootstrap) has nothing
+  // to check and reports nothing.
+  const corePath = await resolveCorePath();
+  if (corePath) {
+    try {
+      result.missingRequirements = coreMissingRequirements(await loadCore(corePath));
+    } catch {
+      // A core.yaml that won't load is `plan`'s error to report, not
+      // status's — status still has a graph to show.
+    }
+  }
+
   console.log(formatStatus(result));
 }
 
@@ -1040,6 +1164,28 @@ function openInBrowser(url) {
   spawn(cmd, args, { detached: true, stdio: 'ignore', shell: platform === 'win32' }).unref();
 }
 
+// True when there is plausibly a local display for a browser to open on.
+// macOS and Windows always have one; on Linux/BSD a session with neither
+// DISPLAY nor WAYLAND_DISPLAY set is headless (an SSH session, a
+// container, an agent's non-interactive shell), and `xdg-open` there
+// either fails silently or blocks on a text browser. Printing the URL is
+// the useful behaviour in that case — a person on the other end of a
+// port-forward can still open it.
+function hasDisplay() {
+  if (process.platform === 'darwin' || process.platform === 'win32') return true;
+  return Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+}
+
+// Hands `url` to the OS browser when that can work, and otherwise prints
+// it. One place, so `plan --open` and `graph` behave identically.
+function presentGraphUrl(url, { noOpen = false } = {}) {
+  if (noOpen || !hasDisplay()) {
+    console.log(`\nOpen ${bold(url)} in a browser to view it.`);
+    return;
+  }
+  openInBrowser(url);
+}
+
 // True if `pid` names a live process. Sending signal 0 performs the
 // existence/permission check without actually signalling anything — the
 // standard POSIX idiom `kill -0` follows, and Node exposes it the same
@@ -1054,12 +1200,14 @@ function isProcessAlive(pid) {
 }
 
 // Returns the port of a running graph server for this project, starting
-// one if none is live. Both `plan` (auto-open after scoping) and `graph`
-// (explicit request) call this rather than each managing their own
-// server, so a project only ever has one live server no matter which
-// command a person or agent happens to run — re-running `plan` after
-// `graph` is already open reuses the same tab's server instead of
-// spawning a second one bound to a different port.
+// one if none is live. Both `plan --open` and `graph` call this rather
+// than each managing their own server, so a project only ever has one
+// live server no matter which command a person or agent happens to run —
+// re-running `plan --open` after `graph` is already open reuses the same
+// tab's server instead of spawning a second one bound to a different
+// port. Nothing else calls it: a command that isn't asked to open the
+// graph starts no server, so it can leave neither a pidfile nor a
+// detached process behind.
 async function startOrReuseGraphServer() {
   const pidfilePath = join(DEST_ROOT, GRAPH_PIDFILE_PATH);
 
@@ -1143,12 +1291,9 @@ async function graphCommand(args) {
   // --no-open covers headless/SSH sessions where there's no local
   // browser to hand a URL to — the server itself is still started (or
   // reused) either way, since a remote person may open the URL manually
-  // via port-forwarding.
-  if (args.includes('--no-open')) {
-    console.log(`\nOpen ${bold(url)} in a browser to view it.`);
-  } else {
-    openInBrowser(url);
-  }
+  // via port-forwarding. presentGraphUrl reaches the same outcome
+  // unasked when the session has no display at all.
+  presentGraphUrl(url, { noOpen: args.includes('--no-open') });
 }
 
 async function whyCommand(args) {
@@ -1322,7 +1467,7 @@ async function main() {
   }
 
   if (cmd === 'plan') {
-    await planCommand();
+    await planCommand(args.slice(1));
     return;
   }
 
